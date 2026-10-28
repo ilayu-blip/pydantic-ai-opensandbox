@@ -85,3 +85,21 @@ was rejected as a default: 10.3 GB.
 `network_policy=NetworkPolicy(default_action='deny')` (needs `[docker] network_mode = "bridge"` and
 the egress sidecar image) → outbound HTTPS fails inside the sandbox; without a policy it returns 200.
 Create with the policy takes ~1.8 s (sidecar).
+
+## Files, second probe
+
+- `list_directory(DirectoryListEntry(path, depth=1))` lists direct children; `depth=None` and `depth=2`
+  recurse, `depth=0` returns nothing. Listing a file → 400 "path is not a directory". Listing **through
+  a symlink to a directory is refused** (400 "path is a symbolic link, refusing to traverse"): resolve
+  the link first.
+- `create_directories` over an existing file *and* under a file both → 500 `RUNTIME_ERROR` "mkdir X: not a
+  directory"; the backend stats first to report `FileExistsError` for the former. Existing directory → OK.
+- `read_bytes` and `write_file` **follow symlinks**. `write_file` always applies its `mode` argument
+  (default 755) to the file, including an existing target (700 became 755): pass the existing mode to
+  keep it, 644 for a new file. `mode` is octal digits written as a decimal int.
+- `delete_files` on a symlink to a directory → 500 "path is a directory" (it follows the link);
+  `delete_files` on a dangling link removes it; `delete_directories` on a missing path or a plain file
+  succeeds (removes the file). Symlinks are removed through the shell (`rm -f`), never by an API that
+  could follow them.
+- `read_bytes(path, offset=, limit=)` reads a byte range.
+- `get_file_info([..])` fails as a whole (404) if any path is missing.

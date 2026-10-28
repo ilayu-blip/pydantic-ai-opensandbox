@@ -70,6 +70,7 @@ venv = ".venv"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 xfail_strict = true
+anyio_mode = "auto"
 filterwarnings = ["error"]
 markers = ["opensandbox_live: runs against a real OpenSandbox server (opt-in)"]
 
