@@ -151,13 +151,13 @@ class FakeCommands:
 
     def _signal(self, execution_id: str, signum: signal.Signals) -> None:
         if (running := self.running.get(execution_id)) is not None:
-            with suppress(ProcessLookupError):
+            with suppress(ProcessLookupError, PermissionError):
                 os.killpg(running.process.pid, signum)
 
     def close(self) -> None:
         """End every process this sandbox started, as killing the sandbox does."""
         for running in self.running.values():
-            with suppress(ProcessLookupError):
+            with suppress(ProcessLookupError, PermissionError):
                 os.killpg(running.process.pid, signal.SIGKILL)
             running.process.wait()
             running.out.close()

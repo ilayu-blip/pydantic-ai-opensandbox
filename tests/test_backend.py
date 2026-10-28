@@ -6,6 +6,7 @@ an unreachable domain) that a healthy local server never gives on demand.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -135,6 +136,14 @@ class TestAcquisition:
         assert backend.ref == _ref(existing.id)
         assert await backend.get_sandbox() is existing
         assert fake_opensandbox.connect_calls == []
+
+    def test_a_new_event_loop_reconnects_the_handle(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        """The SDK's HTTP client is bound to the loop that made the handle, so another loop gets a fresh one."""
+        backend = OpenSandboxBackend()
+        asyncio.run(backend.working_dir())
+        asyncio.run(backend.run(['true']))
+        assert len(fake_opensandbox.create_calls) == 1
+        assert fake_opensandbox.connect_calls == ['sbx-1']
 
 
 class TestAcquisitionErrors:

@@ -236,6 +236,10 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
         # A sandbox this backend created still needs its `working_dir` made.
         self._working_dir_pending = False
         self._acquisition: asyncio.Task[opensandbox.Sandbox] | None = None
+        # The SDK's HTTP client belongs to the event loop that made the handle; a handle this backend made is
+        # reconnected on another loop, as when one backend serves several `run_sync` calls.
+        self._owns_handle = sandbox is None
+        self._handle_loop: asyncio.AbstractEventLoop | None = None
         self._image = image
         self._allow_internet_access = allow_internet_access
         self._sandbox_timeout = sandbox_timeout
@@ -286,6 +290,12 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
                 self._sandbox = sandbox
                 self._ref = WorkspaceRef(provider=PROVIDER, id=sandbox.id)
                 self._working_dir_pending = ref is None and self._working_dir is not None
+                self._handle_loop = asyncio.get_running_loop()
+            elif self._owns_handle and self._handle_loop is not asyncio.get_running_loop():
+                async with self._acquisition_errors(sandbox.id, f'Could not reconnect to sandbox {sandbox.id!r}'):
+                    sandbox = await opensandbox.Sandbox.connect(sandbox.id, connect_timeout=_READY_TIMEOUT)
+                self._sandbox = sandbox
+                self._handle_loop = asyncio.get_running_loop()
             if self._working_dir_pending:
                 assert self._working_dir is not None
                 # Retried on every acquisition until it succeeds.
@@ -500,7 +510,6 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
     async def remove(self, path: str) -> None:
         sandbox = await self._sandbox_for_operation()
         context = f'Could not remove {path!r}'
-        entry = await self._lstat(sandbox, path, context)
         # The removal is recursive, so refuse the working directory and its ancestors, like the built-in backends.
         # The leaf stays unresolved: removing a link removes only the link.
         root = await self.working_dir()
@@ -508,6 +517,7 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
         target = posixpath.normpath(posixpath.join(parent, posixpath.basename(path)))
         if root == target or root.startswith(target.rstrip('/') + '/'):
             raise ValueError('cannot remove the workspace root or its ancestor')
+        entry = await self._lstat(sandbox, path, context)
         if entry.entry_type == 'symlink':
             # The file API follows a link to a directory; `rm` removes the link itself.
             result = await self._probe(['rm', '-f', '--', path], context)
