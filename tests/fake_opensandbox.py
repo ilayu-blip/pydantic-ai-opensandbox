@@ -361,7 +361,7 @@ class FakeSandbox:
             entrypoint=['tail', '-f', '/dev/null'],
             image=SandboxImageSpec(image='fake'),
             metadata={},
-            created_at=datetime.now(timezone.utc),
+            created_at=datetime.now(UTC),
         )
 
     async def get_info(self) -> SandboxInfo:
