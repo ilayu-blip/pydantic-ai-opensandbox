@@ -100,6 +100,8 @@ class FakeCommands:
         self.running: dict[str, _Running] = {}
         # When set, execd's init event (the execution id) never reaches the client, as when the stream drops early.
         self.withhold_init = False
+        # When set, the stream ends without an exit status, as when execd goes away mid-command.
+        self.drop_stream = False
 
     async def run(
         self, command: str | list[str], *, opts: RunCommandOpts | None = None, handlers: ExecutionHandlers | None = None
@@ -142,7 +144,10 @@ class FakeCommands:
             await anyio.sleep(0.01)
         self._sandbox.check_alive()
         del self.running[execution_id]
-        return self._execution(execution_id, -1 if code < 0 else code, out, err)
+        execution = self._execution(execution_id, -1 if code < 0 else code, out, err)
+        if self.drop_stream:
+            execution.exit_code = None
+        return execution
 
     async def interrupt(self, execution_id: str) -> None:
         await self._sandbox.checkpoint('interrupt')
@@ -345,7 +350,6 @@ class FakeSandbox:
         self.commands = FakeCommands(self)
         self.files = FakeFiles(self)
         self.renewals: list[timedelta] = []
-        self.closed = 0
 
     async def checkpoint(self, operation: str) -> None:
         await anyio.lowlevel.checkpoint()
@@ -366,10 +370,6 @@ class FakeSandbox:
             created_at=datetime.now(UTC),
         )
 
-    async def get_info(self) -> SandboxInfo:
-        await self.checkpoint('get_info')
-        return self.info()
-
     async def renew(self, timeout: timedelta) -> SandboxRenewResponse:
         await self.checkpoint('renew')
         self.renewals.append(timeout)
@@ -378,9 +378,6 @@ class FakeSandbox:
     async def kill(self) -> None:
         await anyio.lowlevel.checkpoint()
         self.control.kill(self.id)
-
-    async def close(self) -> None:
-        self.closed += 1
 
 
 class _SandboxClass:
@@ -452,12 +449,6 @@ class FakeManager:
 
     async def close(self) -> None:
         self.closed = True
-
-    async def __aenter__(self) -> FakeManager:
-        return self
-
-    async def __aexit__(self, *args: object) -> None:
-        await self.close()
 
 
 class _ManagerClass:

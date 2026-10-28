@@ -17,6 +17,7 @@ from opensandbox.exceptions import SandboxConnectionException
 from opensandbox.models.sandboxes import NetworkPolicy
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.workspaces import (
+    CommandResult,
     FileEntry,
     WorkspaceError,
     WorkspaceOutputLimitError,
@@ -347,7 +348,7 @@ class TestRun:
 async def _no_process_left(commands: FakeCommands) -> None:
     with anyio.fail_after(5):
         while any(running.process.poll() is None for running in commands.running.values()):
-            await anyio.sleep(0.01)
+            await anyio.sleep(0.01)  # pragma: no cover - depends on how fast the process dies
 
 
 @pytest.fixture
@@ -528,3 +529,173 @@ class TestFilesystem:
         fake_opensandbox.fail('read_bytes', api_error(500, 'RUNTIME_ERROR', 'open file: permission denied'))
         with pytest.raises(PermissionError):
             await backend.read_bytes(str(root / 'file'))
+
+
+class TestFailurePaths:
+    async def test_sandbox_paused_mid_command_is_unavailable(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+
+        async def pause_soon() -> None:
+            await anyio.sleep(0.2)
+            fake_opensandbox.pause('sbx-1')
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(pause_soon)
+            with pytest.raises(WorkspaceUnavailableError, match="'sbx-1' is paused, not running"):
+                await backend.run(['sleep', '30'])
+
+    async def test_rate_limit_propagates(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        limited = api_error(429, 'RATE_LIMITED', 'slow down')
+        fake_opensandbox.fail('run', limited)
+        with pytest.raises(type(limited), match='slow down'):
+            await backend.run(['true'])
+
+    async def test_dropped_stream_propagates_as_transient(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        fake_opensandbox.sandboxes['sbx-1'].commands.drop_stream = True
+        with pytest.raises(SandboxConnectionException, match='without an exit status'):
+            await backend.run(['true'])
+
+    async def test_failed_state_probe_keeps_the_transport_error(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        fake_opensandbox.fail('run', SandboxConnectionException('reset'))
+        fake_opensandbox.fail('get_sandbox_info', RuntimeError('control plane hiccup'))
+        with pytest.raises(SandboxConnectionException, match='reset'):
+            await backend.run(['true'])
+
+    async def test_output_read_failure_is_a_workspace_error(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        fake_opensandbox.fail('read_bytes', api_error(500, 'RUNTIME_ERROR', 'read broke'))
+        with pytest.raises(WorkspaceError, match='Could not read the command output'):
+            await backend.run(['echo', 'hi'])
+
+    async def test_missing_output_file_reads_as_empty(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        fake_opensandbox.fail('read_bytes', api_error(404, 'FILE_NOT_FOUND', 'gone'))
+        assert (await backend.run(['echo', 'hi'])).stdout == ''
+
+    async def test_output_watch_waits_for_the_capture_files(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        fake_opensandbox.fail('get_file_info', api_error(404, 'FILE_NOT_FOUND', 'not yet'))
+        assert (await backend.run(['sh', '-c', 'sleep 0.6; echo done'])).stdout == 'done\n'
+
+    async def test_dangling_symlink_reads_and_lists_as_missing(
+        self, fake_opensandbox: FakeOpenSandbox, root: Path
+    ) -> None:
+        backend = OpenSandboxBackend()
+        (root / 'dangling').symlink_to('nowhere')
+        with pytest.raises(FileNotFoundError):
+            await backend.read_bytes(str(root / 'dangling'))
+        with pytest.raises(FileNotFoundError):
+            await backend.list_dir(str(root / 'dangling'))
+
+    async def test_symlink_removal_failure_is_an_os_error(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend(working_dir=str(root / 'work'))
+        locked = root / 'locked'
+        locked.mkdir()
+        (locked / 'link').symlink_to('nowhere')
+        locked.chmod(0o555)
+        try:
+            with pytest.raises(OSError, match='Permission denied'):
+                await backend.remove(str(locked / 'link'))
+        finally:
+            locked.chmod(0o755)
+
+    async def test_working_dir_probe_failure(
+        self, fake_opensandbox: FakeOpenSandbox, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = OpenSandboxBackend()
+
+        async def broken_pwd(*args: object, **kwargs: object) -> CommandResult:
+            return CommandResult(exit_code=1, stdout='', stderr='pwd: not found')
+
+        monkeypatch.setattr(backend, 'run', broken_pwd)
+        with pytest.raises(WorkspaceError, match='`pwd -P` exited 1'):
+            await backend.working_dir()
+
+    async def test_working_dir_probe_timeout_names_the_operation(
+        self, fake_opensandbox: FakeOpenSandbox, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = OpenSandboxBackend()
+
+        async def stuck(*args: object, **kwargs: object) -> CommandResult:
+            raise WorkspaceTimeoutError('Command timed out after 10 seconds', stdout='partial')
+
+        monkeypatch.setattr(backend, 'run', stuck)
+        with pytest.raises(WorkspaceTimeoutError, match='Could not determine the working directory') as raised:
+            await backend.working_dir()
+        assert raised.value.stdout == 'partial'
+
+    async def test_native_cancel_during_stop_still_stops_the_command(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        """A second `Task.cancel()` while the backend is stopping the command does not abandon the stop."""
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        commands = fake_opensandbox.sandboxes['sbx-1'].commands
+        stopping = asyncio.Event()
+        original = commands.interrupt
+
+        async def slow_interrupt(execution_id: str) -> None:
+            stopping.set()
+            await asyncio.sleep(0.2)
+            await original(execution_id)
+
+        commands.interrupt = slow_interrupt
+        task = asyncio.create_task(backend.run(['sleep', '30']))
+        with anyio.fail_after(5):
+            while not commands.running:
+                await asyncio.sleep(0.01)
+        task.cancel()
+        await stopping.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _no_process_left(commands)
+
+
+class TestArguments:
+    @pytest.mark.parametrize(
+        ('command', 'shell', 'error'),
+        [
+            ('true', False, TypeError),
+            (['true'], True, TypeError),
+            (b'true', False, TypeError),
+            ([], False, TypeError),
+            (['echo', 1], False, TypeError),
+            (['echo', 'a\x00b'], False, ValueError),
+        ],
+    )
+    async def test_malformed_commands_are_refused_before_any_request(
+        self, fake_opensandbox: FakeOpenSandbox, command: object, shell: bool, error: type[Exception]
+    ) -> None:
+        with pytest.raises(error):
+            await OpenSandboxBackend().run(command, shell=shell)  # pyright: ignore[reportArgumentType]
+        assert not fake_opensandbox.create_calls
+
+    @pytest.mark.parametrize('timeout', [0, -1, float('inf'), float('nan')])
+    async def test_bad_timeouts_are_refused(self, fake_opensandbox: FakeOpenSandbox, timeout: float) -> None:
+        with pytest.raises(ValueError, match='timeout must be a positive finite number'):
+            await OpenSandboxBackend().run(['true'], timeout=timeout)
+
+    @pytest.mark.parametrize(
+        ('message', 'reason'),
+        [
+            ('API key is malformed', 'API key is malformed'),
+            ('token expired', 'Credential expired'),
+            ('API key missing', 'Credential missing'),
+        ],
+    )
+    async def test_credential_rejections_are_classified_without_echoing_them(
+        self, fake_opensandbox: FakeOpenSandbox, message: str, reason: str
+    ) -> None:
+        fake_opensandbox.fail('create', api_error(401, 'INVALID_API_KEY', f'{message}: sk-secret'))
+        with pytest.raises(WorkspaceUnavailableError, match=reason) as raised:
+            await OpenSandboxBackend().working_dir()
+        assert 'sk-secret' not in str(raised.value)

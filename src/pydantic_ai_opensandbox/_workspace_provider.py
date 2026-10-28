@@ -9,21 +9,17 @@ from __future__ import annotations
 import asyncio
 import math
 import posixpath
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
-from typing import TypeVar
+from collections.abc import Awaitable, Callable, Mapping
 
 import anyio
 from pydantic_ai.exceptions import UserError
-from pydantic_ai.workspaces import WorkspaceCommand, WorkspaceTimeoutError
+from pydantic_ai.workspaces import WorkspaceCommand
 
 # Optional, not a dependency: it used to arrive only transitively, and AnyIO dropped it in 4.12.
 try:
     import sniffio as _sniffio
 except ModuleNotFoundError:  # pragma: no cover - exercised by the clean-import test in a subprocess
     _sniffio = None
-
-_T = TypeVar('_T')
 
 
 def safe_credential_reason(error: Exception) -> str:
@@ -47,7 +43,7 @@ def running_on_asyncio() -> bool:
     because Trio depends on `sniffio`, so a running asyncio loop means asyncio. If Trio ever drops `sniffio`,
     only guest mode would be misread, as AnyIO would misread it too.
     """
-    if _sniffio is None:
+    if _sniffio is None:  # pragma: no cover - `sniffio` arrives with the OpenSandbox SDK's httpx
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -55,7 +51,7 @@ def running_on_asyncio() -> bool:
         return True
     try:
         return _sniffio.current_async_library() == 'asyncio'
-    except _sniffio.AsyncLibraryNotFoundError:
+    except _sniffio.AsyncLibraryNotFoundError:  # pragma: no cover - only called from async code
         return False
 
 
@@ -102,58 +98,14 @@ async def stop_shielded(stop: Callable[[], Awaitable[object]], *, grace: float =
                 while True:
                     try:
                         await asyncio.sleep(0)
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError:  # pragma: no cover - a third native cancel during the settle
                         continue
                     break
             raise
-    else:
+    else:  # pragma: no cover - every operation refuses Trio before it can start a command to stop
         with anyio.move_on_after(grace, shield=True):
             async with anyio.create_task_group() as group:
                 group.start_soon(best_effort_stop)
-
-
-@asynccontextmanager
-async def command_deadline(
-    timeout: float | None,
-    *,
-    stop: Callable[[], Awaitable[object]],
-    output: Callable[[], tuple[str, str]] = lambda: ('', ''),
-) -> AsyncGenerator[None, None]:
-    """Bound only the command phase, after sandbox acquisition; stop on timeout or cancellation."""
-    with anyio.move_on_after(timeout) as scope:
-        try:
-            yield
-        except BaseException:
-            await stop_shielded(stop)
-            raise
-    if scope.cancelled_caught:
-        stdout, stderr = output()
-        raise WorkspaceTimeoutError(f'Command timed out after {timeout:g} seconds', stdout=stdout, stderr=stderr)
-
-
-async def run_to_completion(call: Callable[[], Awaitable[_T]]) -> _T:
-    """Await `call` in a task of its own and see it finish even if the caller is cancelled meanwhile.
-
-    For work whose outcome must be recorded, such as a created Sprite or a closed client: the
-    caller's cancellation is re-raised only once `call` has finished, and nothing outlives this
-    await. `call` must be bounded; the caller waits for it.
-    """
-    # AnyIO has no detached task: keep this native task alive and referenced until its result is recorded.
-    task = asyncio.ensure_future(call())
-    # Preserve the native cancellation to re-raise after the provider call finishes.
-    cancelled: asyncio.CancelledError | None = None
-    # The AnyIO shield holds off cancel scopes, but native `Task.cancel()` can still interrupt the
-    # caller. `asyncio.wait` does not propagate that cancellation to the independent provider task.
-    with anyio.CancelScope(shield=True):
-        while not task.done():
-            try:
-                await asyncio.wait([task])
-            except asyncio.CancelledError as error:
-                cancelled = error
-    if cancelled is not None:
-        task.exception()  # Retrieve a provider failure before the native cancellation takes precedence.
-        raise cancelled
-    return task.result()
 
 
 def absolute_path(name: str, value: str | None) -> str | None:
@@ -194,18 +146,6 @@ def check_env_types(env: Mapping[str, str] | None) -> None:
     """Raise `TypeError` unless `env` is `None` or maps strings to strings."""
     if env is not None and any(type(key) is not str or type(value) is not str for key, value in env.items()):
         raise TypeError('env keys and values must be strings')
-
-
-def check_env(env: Mapping[str, str] | None) -> None:
-    """Raise unless `env` maps non-empty names without `=` or NUL to strings without NUL.
-
-    A local VM engine passes them on as C strings, which would cut a value short at a NUL.
-    """
-    if env is None:
-        return
-    check_env_types(env)
-    if any(not key or '=' in key or '\0' in key or '\0' in value for key, value in env.items()):
-        raise ValueError('env keys must be non-empty without `=` or NUL, and values must not contain NUL')
 
 
 def check_working_dir(value: str | None) -> None:

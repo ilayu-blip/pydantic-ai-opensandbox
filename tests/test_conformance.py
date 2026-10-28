@@ -14,7 +14,7 @@ import pytest
 from pydantic_ai.workspaces import WorkspaceBackend, WorkspaceRef
 from pydantic_ai.workspaces.conformance import WorkspaceBackendSuite
 
-from pydantic_ai_opensandbox import OpenSandboxBackend
+from pydantic_ai_opensandbox import OpenSandbox, OpenSandboxBackend
 
 from .fake_opensandbox import FakeOpenSandbox
 
@@ -63,9 +63,7 @@ class TestLiveOpenSandboxBackend(WorkspaceBackendSuite):  # pragma: lax no cover
         backend = OpenSandboxBackend(sandbox_timeout=900, working_dir='/root/work')
         yield backend
         if backend.ref is not None:
-            from pydantic_ai_opensandbox._backend import kill_sandbox
-
-            asyncio.run(kill_sandbox(backend.ref.id))
+            asyncio.run(OpenSandbox().destroy(backend.ref))
 
     @pytest.fixture
     def fresh_backend(self) -> Callable[[], WorkspaceBackend]:
