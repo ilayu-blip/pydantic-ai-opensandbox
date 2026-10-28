@@ -98,6 +98,8 @@ class FakeCommands:
         self.calls: list[tuple[str, RunCommandOpts]] = []
         self.interrupts: list[str] = []
         self.running: dict[str, _Running] = {}
+        # When set, execd's init event (the execution id) never reaches the client, as when the stream drops early.
+        self.withhold_init = False
 
     async def run(
         self, command: str | list[str], *, opts: RunCommandOpts | None = None, handlers: ExecutionHandlers | None = None
@@ -130,7 +132,7 @@ class FakeCommands:
         )
         execution_id = uuid.uuid4().hex
         self.running[execution_id] = _Running(process, out, err)
-        if handlers is not None and handlers.on_init is not None:
+        if handlers is not None and handlers.on_init is not None and not self.withhold_init:
             await handlers.on_init(ExecutionInit(id=execution_id, timestamp=_now_ms()))
         deadline = None if opts.timeout is None else anyio.current_time() + opts.timeout.total_seconds()
         while (code := process.poll()) is None:
