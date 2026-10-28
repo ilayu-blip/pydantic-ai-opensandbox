@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pydantic-ai-opensandbox"
+version = "0.1.0"
+description = "Run Pydantic AI agent workspaces in OpenSandbox sandboxes"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic-ai-slim>=2.63.0",
+    "opensandbox>=1.2.0,<2",
+]
+
+[dependency-groups]
+dev = [
+    "anyio>=4.5",
+    "coverage[toml]>=7.10",
+    "inline-snapshot>=0.23",
+    "pydantic-ai-harness",
+    "pydantic-ai-slim[anthropic]",
+    "pyright>=1.1.400",
+    "pytest>=8.3",
+    "ruff>=0.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pydantic_ai_opensandbox"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+preview = true
+explicit-preview-rules = true
+select = ["E4", "E7", "E9", "F"]
+extend-select = ["Q", "RUF100", "RUF018", "RUF043", "C90", "UP", "I", "D", "PLW1514", "PGH003", "BLE001"]
+flake8-quotes = { inline-quotes = "single", multiline-quotes = "double" }
+mccabe = { max-complexity = 15 }
+ignore = ["D100", "D102", "D104", "D105", "D107"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["pydantic_ai_opensandbox"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D"]
+"scripts/**/*.py" = ["D"]
+"examples/**/*.py" = ["D"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnnecessaryIsInstance = false
+reportUnnecessaryTypeIgnoreComment = true
+reportMissingModuleSource = false
+include = ["src", "tests", "examples"]
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+xfail_strict = true
+filterwarnings = ["error"]
+markers = ["opensandbox_live: runs against a real OpenSandbox server (opt-in)"]
+
+[tool.coverage.run]
+branch = true
+source = ["src/pydantic_ai_opensandbox", "tests"]
+
+[tool.coverage.report]
+fail_under = 100
+skip_covered = true
+show_missing = true
+exclude_lines = [
+    'pragma: no cover',
+    'pragma: lax no cover',
+    'if TYPE_CHECKING:',
+    '@overload',
+    'raise NotImplementedError',
+]
+partial_branches = ['pragma: no branch', 'pragma: lax no cover']
