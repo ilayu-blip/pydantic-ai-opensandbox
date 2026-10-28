@@ -229,7 +229,8 @@ class FakeFiles:
         self, path: str, *, range_header: str | None = None, offset: int | None = None, limit: int | None = None
     ) -> bytes:
         await self._check('read_bytes', path)
-        assert range_header is None
+        # `offset`/`limit` are line numbers on the server, and its line reads drop the final newline.
+        assert offset is None and limit is None, 'use range_header for byte ranges: offset/limit count lines'
         target = Path(path)
         if not target.exists():
             raise api_error(404, 'FILE_NOT_FOUND', f'file not found. open {path}: no such file or directory')
@@ -237,9 +238,11 @@ class FakeFiles:
             # execd drops the connection instead of answering a read of a directory.
             raise SandboxConnectionException('Network connectivity error: peer closed connection')
         assert not stat.S_ISFIFO(target.stat().st_mode), 'the backend must not read a FIFO: execd would block'
-        with target.open('rb') as file:
-            file.seek(offset or 0)
-            return file.read() if limit is None else file.read(limit)
+        data = target.read_bytes()
+        if range_header is None:
+            return data
+        start, end = (int(bound) for bound in range_header.removeprefix('bytes=').split('-'))
+        return data[start : end + 1]
 
     async def write_file(
         self,

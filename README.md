@@ -169,6 +169,10 @@ async def delete_sandbox(ref: WorkspaceRef) -> None:
 Creating a sandbox logs `Created OpenSandbox sandbox <id>` at INFO on the `pydantic_ai_opensandbox._backend`
 logger, so the id is on record even if the run ends before it is stored.
 
+If the server never answers a create (`TimeoutError` after 300 seconds, for example while it pulls a large image),
+it may still finish creating a sandbox that no ref or log entry names. That sandbox is deleted when its
+`sandbox_timeout` runs out; list and delete it sooner with the OpenSandbox CLI or API.
+
 ## Configuration
 
 | Option | What it does |

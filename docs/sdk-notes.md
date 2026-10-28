@@ -101,5 +101,6 @@ Create with the policy takes ~1.8 s (sidecar).
   `delete_files` on a dangling link removes it; `delete_directories` on a missing path or a plain file
   succeeds (removes the file). Symlinks are removed through the shell (`rm -f`), never by an API that
   could follow them.
-- `read_bytes(path, offset=, limit=)` reads a byte range.
+- `read_bytes(path, offset=, limit=)` is **line-based** (1-based line numbers; `offset=0` is a 400) and drops
+  the final newline. Read a byte range with `range_header='bytes=0-N'` (inclusive), which is exact.
 - `get_file_info([..])` fails as a whole (404) if any path is missing.

@@ -32,7 +32,12 @@ import anyio
 import anyio.lowlevel
 import opensandbox
 from opensandbox.config import ConnectionConfig
-from opensandbox.exceptions import SandboxApiException, SandboxConnectionException, SandboxException
+from opensandbox.exceptions import (
+    SandboxApiException,
+    SandboxConnectionException,
+    SandboxException,
+    SandboxTimeoutException,
+)
 from opensandbox.models.execd import Execution, ExecutionHandlers, ExecutionInit, RunCommandOpts
 from opensandbox.models.filesystem import DirectoryListEntry, EntryInfo, WriteEntry
 from opensandbox.models.sandboxes import NetworkPolicy
@@ -160,6 +165,19 @@ def _path_error(error: Exception, path: str) -> OSError | None:
 
 def _not_found(path: str | None) -> FileNotFoundError:
     return FileNotFoundError(f'No such file or directory in the OpenSandbox sandbox: {path!r}')
+
+
+def _text(output: bytes) -> str:
+    return output.decode(errors='replace')
+
+
+def _overflow_error(stdout: str, stderr: str) -> WorkspaceOutputLimitError:
+    return WorkspaceOutputLimitError(
+        'OpenSandbox command output exceeded the 10 MiB limit; redirect it to a file and read part of it instead',
+        limit=_MAX_OUTPUT_BYTES,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 def _file_entry(path: str, target: EntryInfo | None) -> FileEntry:
@@ -366,6 +384,13 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
             yield
         except SandboxConnectionException as error:
             raise _unreachable_error() from error
+        except SandboxTimeoutException as error:
+            # Transient, like any slow service, but a server that never answers is often a wrong address.
+            domain = ConnectionConfig().get_domain()
+            raise TimeoutError(
+                f'{context}: the OpenSandbox server at {domain!r} did not answer in time. '
+                'Check OPEN_SANDBOX_DOMAIN, or retry if the server was busy, for example pulling an image.'
+            ) from error
         except Exception as error:
             translated = await self._translate(error, context, None, sandbox_id)
             if translated is error:
@@ -588,16 +613,10 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
             if execution is None:
                 await stop_shielded(launch.stop)
                 stopped = True
-                stdout = await self._read_output(sandbox, launch.out, _OUTPUT_PREVIEW_BYTES)
-                stderr = await self._read_output(sandbox, launch.err, _OUTPUT_PREVIEW_BYTES)
+                stdout = _text(await self._read_output(sandbox, launch.out, _OUTPUT_PREVIEW_BYTES))
+                stderr = _text(await self._read_output(sandbox, launch.err, _OUTPUT_PREVIEW_BYTES))
                 if overflow:
-                    raise WorkspaceOutputLimitError(
-                        'OpenSandbox command output exceeded the 10 MiB limit; '
-                        'redirect it to a file and read part of it instead',
-                        limit=_MAX_OUTPUT_BYTES,
-                        stdout=stdout,
-                        stderr=stderr,
-                    )
+                    raise _overflow_error(stdout, stderr)
                 assert timeout is not None
                 raise WorkspaceTimeoutError(
                     f'Command timed out after {timeout:g} seconds', stdout=stdout, stderr=stderr
@@ -605,9 +624,12 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
             if execution.exit_code is None:
                 # The stream ended without an exit status: execd or the sandbox went away mid-command.
                 raise SandboxConnectionException('The command stream ended without an exit status')
-            stdout = await self._read_output(sandbox, launch.out)
-            stderr = await self._read_output(sandbox, launch.err)
-            return CommandResult(exit_code=execution.exit_code, stdout=stdout, stderr=stderr)
+            # Read one byte past the cap: a command that finished before the first size poll is capped here.
+            stdout = await self._read_output(sandbox, launch.out, _MAX_OUTPUT_BYTES + 1)
+            stderr = await self._read_output(sandbox, launch.err, _MAX_OUTPUT_BYTES + 1)
+            if len(stdout) + len(stderr) > _MAX_OUTPUT_BYTES:
+                raise _overflow_error(_text(stdout[:_OUTPUT_PREVIEW_BYTES]), _text(stderr[:_OUTPUT_PREVIEW_BYTES]))
+            return CommandResult(exit_code=execution.exit_code, stdout=_text(stdout), stderr=_text(stderr))
         except BaseException as error:
             if not stopped:
                 await stop_shielded(launch.stop, grace=_INTERNAL_EXEC_TIMEOUT)
@@ -624,15 +646,16 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
         finally:
             await launch.clean_up()
 
-    async def _read_output(self, sandbox: opensandbox.Sandbox, path: str, limit: int | None = None) -> str:
+    async def _read_output(self, sandbox: opensandbox.Sandbox, path: str, limit: int) -> bytes:
         async with self._sdk_errors(sandbox.id, 'Could not read the command output'):
             try:
-                data = await sandbox.files.read_bytes(path, limit=limit)
+                # A byte range: the file API's `limit` counts lines.
+                data = await sandbox.files.read_bytes(path, range_header=f'bytes=0-{limit - 1}')
             except SandboxApiException as error:
                 if error.status_code != 404:
                     raise
-                return ''  # A command fenced or stopped before it redirected its output.
-        return data.decode(errors='replace')
+                return b''  # A command fenced or stopped before it redirected its output.
+        return data
 
 
 class _Launch:

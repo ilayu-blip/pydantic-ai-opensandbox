@@ -13,7 +13,7 @@ from pathlib import Path
 
 import anyio
 import pytest
-from opensandbox.exceptions import SandboxConnectionException
+from opensandbox.exceptions import SandboxConnectionException, SandboxTimeoutException
 from opensandbox.models.sandboxes import NetworkPolicy
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.workspaces import (
@@ -699,3 +699,26 @@ class TestArguments:
         with pytest.raises(WorkspaceUnavailableError, match=reason) as raised:
             await OpenSandboxBackend().working_dir()
         assert 'sk-secret' not in str(raised.value)
+
+
+class TestReviewFixes:
+    async def test_output_cap_applies_to_a_command_that_finishes_before_the_first_poll(
+        self, fake_opensandbox: FakeOpenSandbox, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr('pydantic_ai_opensandbox._backend._MAX_OUTPUT_BYTES', 1000)
+        monkeypatch.setattr('pydantic_ai_opensandbox._backend._OUTPUT_PREVIEW_BYTES', 10)
+        backend = OpenSandboxBackend()
+        with pytest.raises(WorkspaceOutputLimitError) as raised:
+            await backend.run(['sh', '-c', "head -c 5000 /dev/zero | tr '\\0' a"])
+        assert raised.value.stdout == 'a' * 10
+
+    async def test_a_timeout_while_creating_names_the_domain(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        fake_opensandbox.fail('create', SandboxTimeoutException('Request timed out'))
+        with pytest.raises(TimeoutError, match='OPEN_SANDBOX_DOMAIN') as raised:
+            await OpenSandboxBackend().working_dir()
+        assert not isinstance(raised.value, WorkspaceError)
+
+    async def test_a_timeout_while_attaching_names_the_domain(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        fake_opensandbox.fail('get_sandbox_info', SandboxTimeoutException('Request timed out'))
+        with pytest.raises(TimeoutError, match='OPEN_SANDBOX_DOMAIN'):
+            await OpenSandboxBackend(ref=_ref('sbx-9')).working_dir()
