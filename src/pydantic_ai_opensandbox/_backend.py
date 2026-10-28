@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import posixpath
 import shlex
 import uuid
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -33,12 +34,15 @@ import opensandbox
 from opensandbox.config import ConnectionConfig
 from opensandbox.exceptions import SandboxApiException, SandboxConnectionException, SandboxException
 from opensandbox.models.execd import Execution, ExecutionHandlers, ExecutionInit, RunCommandOpts
-from opensandbox.models.filesystem import WriteEntry
+from opensandbox.models.filesystem import DirectoryListEntry, EntryInfo, WriteEntry
 from opensandbox.models.sandboxes import NetworkPolicy
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.workspaces import (
     CommandResult,
+    FileEntry,
     SupportsCommands,
+    SupportsFilesystem,
+    Workspace,
     WorkspaceBackend,
     WorkspaceError,
     WorkspaceOutputLimitError,
@@ -92,6 +96,9 @@ _CLAIM_PREFIX = '/tmp/.pydantic-ai-opensandbox-'
 
 # execd's per-command stream close delay; see the module docstring.
 _FAST_STREAM_ENV = {'EXECD_API_GRACE_SHUTDOWN': '0s'}
+
+# Octal digits as a decimal int, as the file API takes them.
+_NEW_FILE_MODE = 644
 
 _AUTH_MESSAGE = 'OpenSandbox rejected the API key. Set a valid OPEN_SANDBOX_API_KEY in the environment.'
 
@@ -155,11 +162,19 @@ def _not_found(path: str | None) -> FileNotFoundError:
     return FileNotFoundError(f'No such file or directory in the OpenSandbox sandbox: {path!r}')
 
 
+def _file_entry(path: str, target: EntryInfo | None) -> FileEntry:
+    """The protocol entry for `path`, describing `target`, where a symlink led; `None` for a dangling link."""
+    is_dir = target is not None and target.entry_type == 'directory'
+    # A directory's size is a filesystem detail, not a content length; report none, like the built-in backends.
+    size = target.size if target is not None and target.entry_type == 'file' else None
+    return FileEntry(name=posixpath.basename(path), path=path, is_dir=is_dir, size=size)
+
+
 async def _new_manager() -> opensandbox.SandboxManager:
     return await opensandbox.SandboxManager.create()
 
 
-class OpenSandboxBackend(WorkspaceBackend, SupportsCommands):
+class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem):
     """An [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) sandbox as a Pydantic AI `WorkspaceBackend`.
 
     Commands and file operations run inside a sandbox container on an OpenSandbox server, not on the host. The
@@ -392,6 +407,127 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands):
         if isinstance(error, SandboxException) and not isinstance(error, SandboxConnectionException):
             return WorkspaceError(f'{context}: {error}')
         return error
+
+    async def _lstat(self, sandbox: opensandbox.Sandbox, path: str, context: str) -> EntryInfo:
+        """The server's entry for `path` itself; it does not follow a final symlink."""
+        async with self._sdk_errors(sandbox.id, context, path):
+            return (await sandbox.files.get_file_info([path]))[path]
+
+    async def _follow(self, sandbox: opensandbox.Sandbox, entry: EntryInfo, context: str) -> EntryInfo | None:
+        """The entry `entry` leads to: itself, or a symlink's final target; `None` for a dangling or looping link."""
+        if entry.entry_type != 'symlink':
+            return entry
+        try:
+            resolved = await Workspace(self).realpath(entry.path)
+            target = await self._lstat(sandbox, resolved, context)
+        except (OSError, WorkspaceError):
+            return None
+        # Past the shell's link limit, as in a loop, the path stays a link.
+        return None if target.entry_type == 'symlink' else target
+
+    async def read_bytes(self, path: str) -> bytes:
+        sandbox = await self._sandbox_for_operation()
+        context = f'Could not read {path!r}'
+        target = await self._follow(sandbox, await self._lstat(sandbox, path, context), context)
+        if target is None:
+            raise _not_found(path)
+        if target.entry_type == 'directory':
+            # The server drops the connection rather than answering a read of a directory.
+            raise IsADirectoryError(f'{context}: it is a directory')
+        if target.entry_type != 'file':
+            # A FIFO without a writer would block the server's read.
+            raise OSError(f'{context}: reading a FIFO, socket or device is not supported')
+        async with self._sdk_errors(sandbox.id, context, path):
+            return await sandbox.files.read_bytes(path)
+
+    async def write_bytes(self, path: str, data: bytes) -> None:
+        sandbox = await self._sandbox_for_operation()
+        context = f'Could not write {path!r}'
+        # The server applies the mode it is given to the file it writes, through a symlink too, so an existing
+        # file keeps its own and a new one is not made executable.
+        mode = _NEW_FILE_MODE
+        try:
+            target = await self._follow(sandbox, await self._lstat(sandbox, path, context), context)
+        except FileNotFoundError:
+            target = None
+        if target is not None and target.entry_type == 'directory':
+            raise IsADirectoryError(f'{context}: it is a directory')
+        if target is not None:
+            mode = target.mode
+        async with self._sdk_errors(sandbox.id, context, path):
+            await sandbox.files.write_file(path, data, mode=mode)
+
+    async def stat(self, path: str) -> FileEntry:
+        sandbox = await self._sandbox_for_operation()
+        context = f'Could not stat {path!r}'
+        entry = await self._lstat(sandbox, path, context)
+        return _file_entry(path, await self._follow(sandbox, entry, context))
+
+    async def list_dir(self, path: str) -> Sequence[FileEntry]:
+        sandbox = await self._sandbox_for_operation()
+        context = f'Could not list {path!r}'
+        # The server refuses to list through a symlink, so a link to a directory lists its target.
+        target = await self._follow(sandbox, await self._lstat(sandbox, path, context), context)
+        if target is None:
+            raise _not_found(path)
+        if target.entry_type != 'directory':
+            raise NotADirectoryError(f'{context}: it is not a directory')
+        async with self._sdk_errors(sandbox.id, context, path):
+            entries = await sandbox.files.list_directory(DirectoryListEntry(path=target.path, depth=1))
+        listed = [
+            _file_entry(
+                posixpath.join(path, posixpath.basename(entry.path)), await self._follow(sandbox, entry, context)
+            )
+            for entry in entries
+        ]
+        return sorted(listed, key=lambda entry: entry.name)
+
+    async def make_dir(self, path: str) -> None:
+        sandbox = await self._sandbox_for_operation()
+        context = f'Could not create directory {path!r}'
+        try:
+            entry = await self._lstat(sandbox, path, context)
+        except FileNotFoundError:
+            entry = None
+        if entry is not None:
+            target = await self._follow(sandbox, entry, context)
+            if target is not None and target.entry_type == 'directory':
+                return
+            raise FileExistsError(f'{context}: a file exists there')
+        async with self._sdk_errors(sandbox.id, context, path):
+            await sandbox.files.create_directories([WriteEntry(path=path)])
+
+    async def remove(self, path: str) -> None:
+        sandbox = await self._sandbox_for_operation()
+        context = f'Could not remove {path!r}'
+        entry = await self._lstat(sandbox, path, context)
+        # The removal is recursive, so refuse the working directory and its ancestors, like the built-in backends.
+        # The leaf stays unresolved: removing a link removes only the link.
+        root = await self.working_dir()
+        parent = await Workspace(self).realpath(posixpath.dirname(path))
+        target = posixpath.normpath(posixpath.join(parent, posixpath.basename(path)))
+        if root == target or root.startswith(target.rstrip('/') + '/'):
+            raise ValueError('cannot remove the workspace root or its ancestor')
+        if entry.entry_type == 'symlink':
+            # The file API follows a link to a directory; `rm` removes the link itself.
+            result = await self._probe(['rm', '-f', '--', path], context)
+            if result.exit_code != 0:
+                raise OSError(f'{context}: {result.stderr.strip()}')
+            return
+        async with self._sdk_errors(sandbox.id, context, path):
+            if entry.entry_type == 'directory':
+                await sandbox.files.delete_directories([path])
+            else:
+                await sandbox.files.delete_files([path])
+
+    async def exists(self, path: str) -> bool:
+        sandbox = await self._sandbox_for_operation()
+        context = f'Could not check {path!r}'
+        try:
+            entry = await self._lstat(sandbox, path, context)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return await self._follow(sandbox, entry, context) is not None
 
     async def working_dir(self) -> str:
         """The canonical absolute directory commands start in."""

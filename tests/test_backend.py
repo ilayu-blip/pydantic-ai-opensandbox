@@ -6,6 +6,7 @@ an unreachable domain) that a healthy local server never gives on demand.
 
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from opensandbox.exceptions import SandboxConnectionException
 from opensandbox.models.sandboxes import NetworkPolicy
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.workspaces import (
+    FileEntry,
     WorkspaceError,
     WorkspaceOutputLimitError,
     WorkspaceRef,
@@ -337,3 +339,183 @@ async def _no_process_left(commands: FakeCommands) -> None:
     with anyio.fail_after(5):
         while any(running.process.poll() is None for running in commands.running.values()):
             await anyio.sleep(0.01)
+
+
+@pytest.fixture
+def root(tmp_path: Path) -> Path:
+    return tmp_path.resolve()
+
+
+def _mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+class TestFilesystem:
+    async def test_binary_round_trip(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        data = bytes(range(256)) * 10
+        await backend.write_bytes(str(root / 'a' / 'b.bin'), data)
+        assert await backend.read_bytes(str(root / 'a' / 'b.bin')) == data
+
+    async def test_new_file_is_not_executable(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        await OpenSandboxBackend().write_bytes(str(root / 'new.txt'), b'x')
+        assert _mode(root / 'new.txt') == 0o644
+
+    async def test_write_keeps_an_existing_mode(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        script = root / 'run.sh'
+        script.write_bytes(b'#!/bin/sh\n')
+        script.chmod(0o750)
+        await OpenSandboxBackend().write_bytes(str(script), b'#!/bin/sh\necho hi\n')
+        assert (script.read_bytes(), _mode(script)) == (b'#!/bin/sh\necho hi\n', 0o750)
+
+    async def test_write_through_a_symlink_keeps_the_target_mode(
+        self, fake_opensandbox: FakeOpenSandbox, root: Path
+    ) -> None:
+        target = root / 'target.sh'
+        target.write_bytes(b'old')
+        target.chmod(0o700)
+        (root / 'link').symlink_to(target)
+        await OpenSandboxBackend().write_bytes(str(root / 'link'), b'new')
+        assert (target.read_bytes(), _mode(target)) == (b'new', 0o700)
+        assert (root / 'link').is_symlink()
+
+    async def test_read_errors(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        (root / 'dir').mkdir()
+        (root / 'dirlink').symlink_to(root / 'dir')
+        os.mkfifo(root / 'fifo')
+        with pytest.raises(FileNotFoundError):
+            await backend.read_bytes(str(root / 'missing'))
+        with pytest.raises(IsADirectoryError):
+            await backend.read_bytes(str(root / 'dir'))
+        with pytest.raises(IsADirectoryError):
+            await backend.read_bytes(str(root / 'dirlink'))
+        with pytest.raises(OSError, match='FIFO'):
+            await backend.read_bytes(str(root / 'fifo'))
+
+    async def test_read_through_a_symlink(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        (root / 'file').write_bytes(b'data')
+        (root / 'link').symlink_to('file')
+        assert await OpenSandboxBackend().read_bytes(str(root / 'link')) == b'data'
+
+    async def test_write_errors(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        (root / 'dir').mkdir()
+        (root / 'file').write_bytes(b'x')
+        with pytest.raises(IsADirectoryError):
+            await backend.write_bytes(str(root / 'dir'), b'x')
+        with pytest.raises(NotADirectoryError):
+            await backend.write_bytes(str(root / 'file' / 'child'), b'x')
+
+    async def test_stat(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        (root / 'dir').mkdir()
+        (root / 'file').write_bytes(b'four')
+        (root / 'dirlink').symlink_to('dir')
+        (root / 'dangling').symlink_to('nowhere')
+        assert await backend.stat(str(root / 'file')) == FileEntry(
+            name='file', path=str(root / 'file'), is_dir=False, size=4
+        )
+        assert await backend.stat(str(root / 'dir')) == FileEntry(
+            name='dir', path=str(root / 'dir'), is_dir=True, size=None
+        )
+        assert (await backend.stat(str(root / 'dirlink'))).is_dir
+        assert await backend.stat(str(root / 'dangling')) == FileEntry(
+            name='dangling', path=str(root / 'dangling'), is_dir=False, size=None
+        )
+        with pytest.raises(FileNotFoundError):
+            await backend.stat(str(root / 'missing'))
+
+    async def test_list_dir(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        (root / 'b').mkdir()
+        (root / 'a').write_bytes(b'x')
+        (root / 'loop').symlink_to('loop')
+        entries = await backend.list_dir(str(root))
+        assert [(entry.name, entry.path, entry.is_dir) for entry in entries] == [
+            ('a', str(root / 'a'), False),
+            ('b', str(root / 'b'), True),
+            ('loop', str(root / 'loop'), False),
+        ]
+
+    async def test_list_dir_through_a_symlink(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        (root / 'real').mkdir()
+        (root / 'real' / 'child').write_bytes(b'x')
+        (root / 'link').symlink_to('real')
+        entries = await OpenSandboxBackend().list_dir(str(root / 'link'))
+        assert [(entry.name, entry.path) for entry in entries] == [('child', str(root / 'link' / 'child'))]
+
+    async def test_list_dir_errors(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        (root / 'file').write_bytes(b'x')
+        with pytest.raises(NotADirectoryError):
+            await backend.list_dir(str(root / 'file'))
+        with pytest.raises(FileNotFoundError):
+            await backend.list_dir(str(root / 'missing'))
+
+    async def test_make_dir(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        await backend.make_dir(str(root / 'a' / 'b'))
+        await backend.make_dir(str(root / 'a' / 'b'))
+        assert (root / 'a' / 'b').is_dir()
+        (root / 'file').write_bytes(b'x')
+        with pytest.raises(FileExistsError):
+            await backend.make_dir(str(root / 'file'))
+        with pytest.raises(NotADirectoryError):
+            await backend.make_dir(str(root / 'file' / 'child'))
+
+    async def test_remove(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend(working_dir=str(root / 'work'))
+        (root / 'file').write_bytes(b'x')
+        (root / 'tree' / 'nested').mkdir(parents=True)
+        (root / 'tree' / 'nested' / 'f').write_bytes(b'x')
+        await backend.remove(str(root / 'file'))
+        await backend.remove(str(root / 'tree'))
+        assert not (root / 'file').exists() and not (root / 'tree').exists()
+        with pytest.raises(FileNotFoundError):
+            await backend.remove(str(root / 'missing'))
+
+    async def test_remove_a_symlink_removes_only_the_link(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend(working_dir=str(root / 'work'))
+        (root / 'dir').mkdir()
+        (root / 'dir' / 'keep').write_bytes(b'x')
+        (root / 'dirlink').symlink_to('dir')
+        (root / 'dangling').symlink_to('nowhere')
+        await backend.remove(str(root / 'dirlink'))
+        await backend.remove(str(root / 'dangling'))
+        assert (root / 'dir' / 'keep').exists()
+        assert not (root / 'dirlink').is_symlink() and not (root / 'dangling').is_symlink()
+
+    async def test_remove_refuses_the_working_dir_and_its_ancestors(
+        self, fake_opensandbox: FakeOpenSandbox, root: Path
+    ) -> None:
+        backend = OpenSandboxBackend(working_dir=str(root / 'work'))
+        for path in (root / 'work', root):
+            with pytest.raises(ValueError, match='cannot remove the workspace root'):
+                await backend.remove(str(path))
+
+    async def test_exists(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        (root / 'file').write_bytes(b'x')
+        (root / 'dangling').symlink_to('nowhere')
+        assert await backend.exists(str(root / 'file'))
+        assert await backend.exists(str(root))
+        assert not await backend.exists(str(root / 'missing'))
+        assert not await backend.exists(str(root / 'dangling'))
+
+    async def test_unexpected_file_api_errors_are_workspace_errors(
+        self, fake_opensandbox: FakeOpenSandbox, root: Path
+    ) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        fake_opensandbox.fail('get_file_info', api_error(500, 'RUNTIME_ERROR', 'disk on fire'))
+        with pytest.raises(WorkspaceError, match='disk on fire'):
+            await backend.stat(str(root))
+
+    async def test_permission_errors_are_builtin(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        (root / 'file').write_bytes(b'x')
+        await backend.working_dir()
+        fake_opensandbox.fail('read_bytes', api_error(500, 'RUNTIME_ERROR', 'open file: permission denied'))
+        with pytest.raises(PermissionError):
+            await backend.read_bytes(str(root / 'file'))
