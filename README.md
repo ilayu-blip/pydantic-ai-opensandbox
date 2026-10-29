@@ -14,10 +14,10 @@ same interface as the harness's
 
 ## Install
 
-The package is not on PyPI yet. Install it from a checkout:
+The package is not on PyPI yet. Install it from GitHub:
 
 ```bash
-uv add ./pydantic-ai-opensandbox "pydantic-ai-harness" "pydantic-ai-slim[anthropic]"
+uv add "pydantic-ai-opensandbox @ git+https://github.com/ilayu-blip/pydantic-ai-opensandbox" "pydantic-ai-harness" "pydantic-ai-slim[anthropic]"
 ```
 
 The `anthropic` extra is there because the examples use an Anthropic model; swap it for your model provider's

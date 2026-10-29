@@ -2,6 +2,8 @@
 
 Copied from `pydantic_ai_harness/_workspace_provider.py` (pydantic/pydantic-ai@60169ac70), which is private to
 the harness. Keep in sync by hand.
+
+Copyright (c) Pydantic Services Inc. 2024 to present, MIT License.
 """
 
 from __future__ import annotations

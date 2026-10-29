@@ -8,10 +8,17 @@ version = "0.1.0"
 description = "Run Pydantic AI agent workspaces in OpenSandbox sandboxes"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "ilayu" }]
 dependencies = [
     "pydantic-ai-slim>=2.63.0",
     "opensandbox>=1.2.0,<2",
 ]
+
+[project.urls]
+Repository = "https://github.com/ilayu-blip/pydantic-ai-opensandbox"
+Issues = "https://github.com/ilayu-blip/pydantic-ai-opensandbox/issues"
 
 [dependency-groups]
 dev = [
