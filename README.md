@@ -134,7 +134,9 @@ Already have an `opensandbox.Sandbox`? Pass `workspace=OpenSandboxBackend(sandbo
   under `/tmp` in the sandbox and read back byte-exact, because execd's own stream splits output into lines.
 - On a timeout or cancellation, the backend interrupts the command's process group through execd. A command
   that has not reported its execution id yet is fenced or killed through a claim directory, so it cannot start
-  late. The sandbox keeps running.
+  late. A fenced command leaves its empty claim directory (`/tmp/.pydantic-ai-opensandbox-*`) in the sandbox, on
+  purpose: removing it would let a late start through. The sandbox keeps running.
+- `WorkspaceTimeoutError` carries the command's output so far, up to the 10 MiB cap.
 - A command whose combined output passes 10 MiB is stopped the same way and raises `WorkspaceOutputLimitError`,
   with the first 64 KiB of each stream. Redirect large output to a file instead.
 - A command killed by a signal returns `exit_code=-1`, as execd reports it.

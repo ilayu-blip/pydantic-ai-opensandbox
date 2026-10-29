@@ -102,9 +102,21 @@ class FakeCommands:
         self.withhold_init = False
         # When set, the stream ends without an exit status, as when execd goes away mid-command.
         self.drop_stream = False
+        self.in_flight = 0
+        self.max_in_flight = 0
 
     async def run(
         self, command: str | list[str], *, opts: RunCommandOpts | None = None, handlers: ExecutionHandlers | None = None
+    ) -> Execution:
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            return await self._run(command, opts, handlers)
+        finally:
+            self.in_flight -= 1
+
+    async def _run(
+        self, command: str | list[str], opts: RunCommandOpts | None, handlers: ExecutionHandlers | None
     ) -> Execution:
         await self._sandbox.checkpoint('run')
         if not isinstance(command, str):
@@ -353,6 +365,7 @@ class FakeSandbox:
         self.commands = FakeCommands(self)
         self.files = FakeFiles(self)
         self.renewals: list[timedelta] = []
+        self.closed = 0
 
     async def checkpoint(self, operation: str) -> None:
         await anyio.lowlevel.checkpoint()
@@ -372,6 +385,9 @@ class FakeSandbox:
             metadata={},
             created_at=datetime.now(UTC),
         )
+
+    async def close(self) -> None:
+        self.closed += 1
 
     async def renew(self, timeout: timedelta) -> SandboxRenewResponse:
         await self.checkpoint('renew')

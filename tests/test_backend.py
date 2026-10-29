@@ -13,7 +13,7 @@ from pathlib import Path
 
 import anyio
 import pytest
-from opensandbox.exceptions import SandboxConnectionException, SandboxTimeoutException
+from opensandbox.exceptions import SandboxConnectionException, SandboxReadyTimeoutException, SandboxTimeoutException
 from opensandbox.models.sandboxes import NetworkPolicy
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.workspaces import (
@@ -722,3 +722,108 @@ class TestReviewFixes:
         fake_opensandbox.fail('get_sandbox_info', SandboxTimeoutException('Request timed out'))
         with pytest.raises(TimeoutError, match='OPEN_SANDBOX_DOMAIN'):
             await OpenSandboxBackend(ref=_ref('sbx-9')).working_dir()
+
+
+class TestMinorFixes:
+    async def test_symlink_lookup_on_a_gone_sandbox_is_unavailable(
+        self, fake_opensandbox: FakeOpenSandbox, root: Path
+    ) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        (root / 'link').symlink_to('target')
+        # The sandbox disappears between the stat and the shell command that resolves the link.
+        fake_opensandbox.fail('run', api_error(404, 'DOCKER::SANDBOX_NOT_FOUND', 'Sandbox sbx-1 not found.'))
+        with pytest.raises(WorkspaceUnavailableError):
+            await backend.stat(str(root / 'link'))
+
+    async def test_timeout_keeps_output_past_the_overflow_preview(
+        self, fake_opensandbox: FakeOpenSandbox, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr('pydantic_ai_opensandbox._backend._OUTPUT_PREVIEW_BYTES', 10)
+        backend = OpenSandboxBackend()
+        with pytest.raises(WorkspaceTimeoutError) as raised:
+            await backend.run(['sh', '-c', "printf '%0100d' 0; sleep 30"], timeout=0.5)
+        assert len(raised.value.stdout) == 100
+
+    async def test_timeout_before_the_init_event_keeps_output_and_cleans_up(
+        self, fake_opensandbox: FakeOpenSandbox
+    ) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        commands = fake_opensandbox.sandboxes['sbx-1'].commands
+        commands.withhold_init = True
+        before = set(Path('/tmp').glob('.pydantic-ai-opensandbox-*'))
+        with pytest.raises(WorkspaceTimeoutError) as raised:
+            await backend.run(['sh', '-c', 'echo started; sleep 30'], timeout=0.5)
+        assert raised.value.stdout == 'started\n'
+        await _no_process_left(commands)
+        commands.withhold_init = False
+        assert set(Path('/tmp').glob('.pydantic-ai-opensandbox-*')) == before
+
+    async def test_a_slow_stop_on_timeout_still_ends_the_command(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        commands = fake_opensandbox.sandboxes['sbx-1'].commands
+        original = commands.interrupt
+
+        async def slow_interrupt(execution_id: str) -> None:
+            await asyncio.sleep(3)
+            await original(execution_id)
+
+        commands.interrupt = slow_interrupt
+        with pytest.raises(WorkspaceTimeoutError):
+            await backend.run(['sleep', '30'], timeout=0.2)
+        await _no_process_left(commands)
+
+    def test_reconnecting_closes_the_old_handle(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        backend = OpenSandboxBackend()
+        asyncio.run(backend.working_dir())
+        asyncio.run(backend.run(['true']))
+        assert fake_opensandbox.sandboxes['sbx-1'].closed == 1
+
+    @pytest.mark.parametrize('state', ['Stopping', 'Terminated', 'Failed'])
+    async def test_attach_to_a_dead_state_is_unavailable_without_connecting(
+        self, fake_opensandbox: FakeOpenSandbox, state: str
+    ) -> None:
+        existing = await _existing(fake_opensandbox)
+        existing.state = state
+        with pytest.raises(WorkspaceUnavailableError, match=f'is {state.lower()}'):
+            await OpenSandboxBackend(ref=_ref(existing.id)).working_dir()
+        assert fake_opensandbox.connect_calls == []
+
+    async def test_list_dir_resolves_symlinks_concurrently(self, fake_opensandbox: FakeOpenSandbox, root: Path) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        for index in range(5):
+            (root / f'link{index}').symlink_to('target')
+        entries = await backend.list_dir(str(root))
+        assert [entry.name for entry in entries] == [f'link{index}' for index in range(5)]
+        assert fake_opensandbox.sandboxes['sbx-1'].commands.max_in_flight > 1
+
+    async def test_list_dir_reports_a_failed_symlink_lookup(
+        self, fake_opensandbox: FakeOpenSandbox, root: Path
+    ) -> None:
+        backend = OpenSandboxBackend()
+        await backend.working_dir()
+        (root / 'link').symlink_to('target')
+        fake_opensandbox.fail('run', api_error(404, 'DOCKER::SANDBOX_NOT_FOUND', 'Sandbox sbx-1 not found.'))
+        with pytest.raises(WorkspaceUnavailableError):
+            await backend.list_dir(str(root))
+
+    async def test_a_domain_that_is_not_an_opensandbox_server_is_named(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        fake_opensandbox.fail('create', api_error(501, 'UNEXPECTED_RESPONSE', 'HTTP 501: <!DOCTYPE HTML>'))
+        with pytest.raises(WorkspaceError, match='OPEN_SANDBOX_DOMAIN'):
+            await OpenSandboxBackend().working_dir()
+
+    async def test_attach_health_check_failure_is_a_workspace_error(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        existing = await _existing(fake_opensandbox)
+        fake_opensandbox.fail('connect', SandboxReadyTimeoutException('Sandbox health check timed out'))
+        with pytest.raises(WorkspaceError, match='health check timed out'):
+            await OpenSandboxBackend(ref=_ref(existing.id)).working_dir()
+
+    async def test_rate_limit_while_creating_propagates_unchanged(self, fake_opensandbox: FakeOpenSandbox) -> None:
+        limited = api_error(429, 'UNEXPECTED_RESPONSE', 'Too Many Requests')
+        fake_opensandbox.fail('create', limited)
+        with pytest.raises(type(limited)) as raised:
+            await OpenSandboxBackend().working_dir()
+        assert raised.value is limited and raised.value.__cause__ is not limited

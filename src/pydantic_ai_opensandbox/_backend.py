@@ -99,6 +99,12 @@ _OUTPUT_POLL_INTERVAL = 0.25
 # Each command's claim directory, holding its pid and output, under the sandbox's `/tmp`.
 _CLAIM_PREFIX = '/tmp/.pydantic-ai-opensandbox-'
 
+# States a sandbox does not come back from.
+_ENDED_STATES = frozenset({'Stopping', 'Terminated', 'Failed'})
+
+# What the stop script prints when it found a launched command rather than fencing one.
+_LAUNCHED = 'launched'
+
 # execd's per-command stream close delay; see the module docstring.
 _FAST_STREAM_ENV = {'EXECD_API_GRACE_SHUTDOWN': '0s'}
 
@@ -136,10 +142,12 @@ def _unreachable_error() -> WorkspaceUnavailableError:
 
 def _gone_message(sandbox_id: str, state: str | None = None) -> str:
     if state is not None:
-        return (
-            f'The OpenSandbox sandbox {sandbox_id!r} is {state.lower()}, not running. '
-            'A later run that attaches to a paused sandbox resumes it.'
+        next_step = (
+            "Pass `workspace='new'` to start a fresh sandbox."
+            if state in _ENDED_STATES
+            else 'A later run that attaches to it resumes it.'
         )
+        return f'The OpenSandbox sandbox {sandbox_id!r} is {state.lower()}, not running. {next_step}'
     return (
         f'The OpenSandbox sandbox {sandbox_id!r} no longer exists: it was killed or its `sandbox_timeout` ran out. '
         "Pass `workspace='new'` to start a fresh sandbox."
@@ -310,8 +318,11 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
                 self._working_dir_pending = ref is None and self._working_dir is not None
                 self._handle_loop = asyncio.get_running_loop()
             elif self._owns_handle and self._handle_loop is not asyncio.get_running_loop():
+                stale = sandbox
                 async with self._acquisition_errors(sandbox.id, f'Could not reconnect to sandbox {sandbox.id!r}'):
                     sandbox = await opensandbox.Sandbox.connect(sandbox.id, connect_timeout=_READY_TIMEOUT)
+                # Releases the old handle's HTTP client; `close` logs rather than raises.
+                await stale.close()
                 self._sandbox = sandbox
                 self._handle_loop = asyncio.get_running_loop()
             if self._working_dir_pending:
@@ -370,6 +381,8 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
                 info = await manager.get_sandbox_info(sandbox_id)
             finally:
                 await manager.close()
+            if info.status.state in _ENDED_STATES:
+                raise WorkspaceUnavailableError(_gone_message(sandbox_id, info.status.state))
             if info.status.state == 'Paused':
                 sandbox = await opensandbox.Sandbox.resume(sandbox_id, resume_timeout=_READY_TIMEOUT)
             else:
@@ -390,6 +403,18 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
             raise TimeoutError(
                 f'{context}: the OpenSandbox server at {domain!r} did not answer in time. '
                 'Check OPEN_SANDBOX_DOMAIN, or retry if the server was busy, for example pulling an image.'
+            ) from error
+        except SandboxApiException as error:
+            if error.error.code != 'UNEXPECTED_RESPONSE' or error.status_code in (401, 403, 429):
+                translated = await self._translate(error, context, None, sandbox_id)
+                if translated is error:
+                    raise
+                raise translated from error
+            # The SDK could not read the answer as an OpenSandbox error: often another service at that address.
+            domain = ConnectionConfig().get_domain()
+            raise WorkspaceError(
+                f'{context}: the server at {domain!r} did not answer like an OpenSandbox server '
+                f'(HTTP {error.status_code}). Check OPEN_SANDBOX_DOMAIN.'
             ) from error
         except Exception as error:
             translated = await self._translate(error, context, None, sandbox_id)
@@ -455,6 +480,8 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
         try:
             resolved = await Workspace(self).realpath(entry.path)
             target = await self._lstat(sandbox, resolved, context)
+        except (WorkspaceUnavailableError, WorkspaceTimeoutError):
+            raise
         except (OSError, WorkspaceError):
             return None
         # Past the shell's link limit, as in a loop, the path stays a link.
@@ -509,13 +536,27 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
             raise NotADirectoryError(f'{context}: it is not a directory')
         async with self._sdk_errors(sandbox.id, context, path):
             entries = await sandbox.files.list_directory(DirectoryListEntry(path=target.path, depth=1))
-        listed = [
-            _file_entry(
-                posixpath.join(path, posixpath.basename(entry.path)), await self._follow(sandbox, entry, context)
-            )
-            for entry in entries
-        ]
-        return sorted(listed, key=lambda entry: entry.name)
+        resolved: list[FileEntry | None] = [None] * len(entries)
+        failures: list[Exception | None] = [None] * len(entries)
+        limit = anyio.Semaphore(16)
+
+        async def resolve(index: int, entry: EntryInfo) -> None:
+            # A symlink needs a shell round trip; cap concurrent lookups without changing the order returned.
+            async with limit:
+                try:
+                    target = await self._follow(sandbox, entry, context)
+                except Exception as error:  # noqa: BLE001 - re-raised below, outside the task group's exception group
+                    failures[index] = error
+                    return
+            resolved[index] = _file_entry(posixpath.join(path, posixpath.basename(entry.path)), target)
+
+        async with anyio.create_task_group() as group:
+            for index, entry in enumerate(entries):
+                group.start_soon(resolve, index, entry)
+        for error in failures:
+            if error is not None:
+                raise error
+        return sorted((entry for entry in resolved if entry is not None), key=lambda entry: entry.name)
 
     async def make_dir(self, path: str) -> None:
         sandbox = await self._sandbox_for_operation()
@@ -611,10 +652,12 @@ class OpenSandboxBackend(WorkspaceBackend, SupportsCommands, SupportsFilesystem)
         try:
             execution, overflow = await launch.execute(opts, timeout)
             if execution is None:
-                await stop_shielded(launch.stop)
+                await stop_shielded(launch.stop, grace=_INTERNAL_EXEC_TIMEOUT)
                 stopped = True
-                stdout = _text(await self._read_output(sandbox, launch.out, _OUTPUT_PREVIEW_BYTES))
-                stderr = _text(await self._read_output(sandbox, launch.err, _OUTPUT_PREVIEW_BYTES))
+                # A timeout keeps all the output so far, up to the cap; an overflow keeps a preview.
+                limit = _OUTPUT_PREVIEW_BYTES if overflow else _MAX_OUTPUT_BYTES
+                stdout = _text(await self._read_output(sandbox, launch.out, limit))
+                stderr = _text(await self._read_output(sandbox, launch.err, limit))
                 if overflow:
                     raise _overflow_error(stdout, stderr)
                 assert timeout is not None
@@ -677,6 +720,8 @@ class _Launch:
         )
         self.execution_id: str | None = None
         self._completed = False
+        # Whether a stop found the launcher had already run, so its claim no longer fences anything.
+        self._launched = False
 
     async def _on_init(self, init: ExecutionInit) -> None:
         self.execution_id = init.id
@@ -719,18 +764,20 @@ class _Launch:
         if self.execution_id is not None:
             await self._sandbox.commands.interrupt(self.execution_id)
             return
-        # The start's init event never arrived: fence the launcher, or end the group it registered.
+        # The start's init event never arrived: fence the launcher, or end the group it registered. The claim and
+        # its output stay for the caller to read; `clean_up` removes them once the launcher is known to have run.
         claim = self._claim
-        await self._sandbox.commands.run(
+        execution = await self._sandbox.commands.run(
             f'if mkdir {claim} 2>/dev/null; then exit 0; fi; '
             f'i=0; while [ ! -s {claim}/pid ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done; '
-            f'p=$(cat {claim}/pid 2>/dev/null) && kill -KILL -- "-$p" 2>/dev/null; rm -rf {claim}; true',
+            f'p=$(cat {claim}/pid 2>/dev/null) && kill -KILL -- "-$p" 2>/dev/null; echo {_LAUNCHED}',
             opts=RunCommandOpts(timeout=timedelta(seconds=_INTERNAL_EXEC_TIMEOUT)),
         )
+        self._launched = any(message.text == _LAUNCHED for message in execution.logs.stdout)
 
     async def clean_up(self) -> None:
         """Remove the claim once the command is known to have started; one a stop took fences a late launcher."""
-        if self.execution_id is None and not self._completed:
+        if self.execution_id is None and not self._completed and not self._launched:
             return
         with anyio.move_on_after(1, shield=True):
             try:
