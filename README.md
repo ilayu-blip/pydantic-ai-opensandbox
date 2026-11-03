@@ -11,7 +11,7 @@
 > from pydantic_ai_harness.opensandbox_sandbox import OpenSandbox
 > ```
 >
-> See its [documentation](https://pydantic.dev/docs/ai/harness/opensandbox-sandbox/) and
+> See its [documentation](https://github.com/pydantic/pydantic-ai/blob/main/src/pydantic_ai_harness/pydantic_ai_harness/opensandbox_sandbox/README.md) and
 > [source](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_ai_harness/pydantic_ai_harness/opensandbox_sandbox).
 > Two things this package did that the official one doesn't yet are proposed upstream:
 > resuming a paused sandbox ([pydantic/pydantic-ai#12349](https://github.com/pydantic/pydantic-ai/issues/12349))
