@@ -1,5 +1,23 @@
 # pydantic-ai-opensandbox
 
+> [!IMPORTANT]
+> **Archived: use the official capability instead.** Pydantic AI Harness now ships `OpenSandbox` itself:
+>
+> ```bash
+> uv add "pydantic-ai-harness[coder,opensandbox]"
+> ```
+>
+> ```python
+> from pydantic_ai_harness.opensandbox_sandbox import OpenSandbox
+> ```
+>
+> See its [documentation](https://pydantic.dev/docs/ai/harness/opensandbox-sandbox/) and
+> [source](https://github.com/pydantic/pydantic-ai/tree/main/src/pydantic_ai_harness/pydantic_ai_harness/opensandbox_sandbox).
+> Two things this package did that the official one doesn't yet are proposed upstream:
+> resuming a paused sandbox ([pydantic/pydantic-ai#12349](https://github.com/pydantic/pydantic-ai/issues/12349))
+> and execd's native file API ([pydantic/pydantic-ai#12350](https://github.com/pydantic/pydantic-ai/issues/12350)).
+> This repository stays readable for reference.
+
 Run your [Pydantic AI](https://pydantic.dev/docs/ai/) agent's commands and file edits in an isolated
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) sandbox, on your own Docker host or Kubernetes
 cluster, instead of on your machine.
